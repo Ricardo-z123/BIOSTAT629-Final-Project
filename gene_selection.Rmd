@@ -1,0 +1,264 @@
+---
+title: "Gene Panel Selection for Final Project"
+author: "Yiqiao Zhu"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Objective
+
+Construct a curated breast cancer driver gene panel for the subtype-stratified
+survival analysis, by intersecting:
+
+1. **COSMIC Cancer Gene Census (v103)** — externally curated cancer driver genes
+   annotated with tumor type (breast-related).
+2. **MSK-CHORD 2024 breast cohort** — genes with patient-level mutation rate
+   above a pre-specified frequency threshold (ensures adequate statistical
+   power in subtype-stratified analyses).
+
+The final panel is the **intersection** of these two lists.
+
+> **Rationale for avoiding OS-based selection:**
+> Any gene selection that uses survival outcome (e.g., pooled Lasso-Cox) biases
+> the downstream subtype analysis by favoring genes with consistent effects
+> across subtypes, and missing subtype-specific heterogeneity — which is
+> precisely what this project aims to discover.
+
+---
+
+# Setup
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(knitr)
+```
+
+```{r paths}
+# ---- File paths (Mac absolute paths; change as needed) --------------------
+proj_dir    <- "/Users/yiqiaozhu/Desktop/BIOS 629"
+final_dir   <- file.path(proj_dir, "Final Project")
+mskchord_dir<- file.path(proj_dir, "msk_chord_2024")
+
+cosmic_path <- file.path(
+  final_dir,
+  "Cosmic_CancerGeneCensus_Tsv_v103_GRCh38",
+  "Cosmic_CancerGeneCensus_v103_GRCh38.tsv"
+)
+
+patient_path <- file.path(mskchord_dir, "data_clinical_patient.txt")
+sample_path  <- file.path(mskchord_dir, "data_clinical_sample.txt")
+mut_path     <- file.path(mskchord_dir, "data_mutations.txt")
+```
+
+---
+
+# Step 1 — Load COSMIC Cancer Gene Census
+
+```{r load-cosmic}
+cgc <- read.delim(cosmic_path, sep = "\t", header = TRUE,
+                  stringsAsFactors = FALSE, quote = "")
+
+cat("CGC total genes:", nrow(cgc), "\n")
+cat("Column names:\n"); print(names(cgc))
+```
+
+Inspect tier and role distributions:
+
+```{r cosmic-distribution}
+cat("\nTIER distribution (Tier 1 = strong evidence, Tier 2 = emerging):\n")
+print(table(cgc$TIER, useNA = "ifany"))
+
+cat("\nFirst few rows:\n")
+head(cgc %>% select(GENE_SYMBOL, TIER, ROLE_IN_CANCER, TUMOUR_TYPES_SOMATIC), 10)
+```
+
+---
+
+# Step 2 — Filter COSMIC for Breast Cancer Drivers
+
+We retain genes whose `TUMOUR_TYPES_SOMATIC` field contains "breast"
+(case-insensitive).
+
+```{r filter-breast}
+breast_drivers <- cgc %>%
+  filter(grepl("breast", TUMOUR_TYPES_SOMATIC, ignore.case = TRUE)) %>%
+  select(GENE_SYMBOL, TIER, ROLE_IN_CANCER, TUMOUR_TYPES_SOMATIC)
+
+cat("Breast-related drivers in CGC:", nrow(breast_drivers), "\n")
+```
+
+Show the full breast driver list:
+
+```{r show-breast-drivers}
+kable(breast_drivers, caption = "COSMIC breast cancer drivers (v103)")
+```
+
+Optional: restrict to Tier 1 only (stronger evidence):
+
+```{r breast-tier1}
+breast_drivers_tier1 <- breast_drivers %>% filter(TIER == "1")
+cat("Breast Tier-1 drivers only:", nrow(breast_drivers_tier1), "\n")
+```
+
+---
+
+# Step 3 — Compute Gene Mutation Frequencies in MSK-CHORD BC Cohort
+
+```{r load-msk}
+pat  <- read.delim(patient_path, comment.char = "#",
+                   stringsAsFactors = FALSE, check.names = FALSE)
+samp <- read.delim(sample_path,  comment.char = "#",
+                   stringsAsFactors = FALSE, check.names = FALSE)
+mut  <- read.delim(mut_path,     comment.char = "#",
+                   stringsAsFactors = FALSE, check.names = FALSE)
+
+bc_samp <- samp %>% filter(CANCER_TYPE == "Breast Cancer")
+bc_ids  <- unique(bc_samp$PATIENT_ID)
+
+cat("BC samples:", nrow(bc_samp), "\n")
+cat("BC patients (unique):", length(bc_ids), "\n")
+```
+
+Aggregate mutations to the patient level (a patient is "mutated" in a gene if
+**any** of their samples harbors a mutation in that gene):
+
+```{r patient-level-mutation}
+bc_mut <- mut %>%
+  filter(Tumor_Sample_Barcode %in% bc_samp$SAMPLE_ID) %>%
+  inner_join(bc_samp %>% select(SAMPLE_ID, PATIENT_ID),
+             by = c("Tumor_Sample_Barcode" = "SAMPLE_ID"))
+
+gene_freq <- bc_mut %>%
+  distinct(PATIENT_ID, Hugo_Symbol) %>%
+  count(Hugo_Symbol, name = "n_mut") %>%
+  mutate(rate_pct = round(n_mut / length(bc_ids) * 100, 2)) %>%
+  arrange(desc(n_mut))
+
+cat("Distinct mutated genes in BC cohort:", nrow(gene_freq), "\n\n")
+head(gene_freq, 30)
+```
+
+---
+
+# Step 4 — Apply Frequency Threshold
+
+Choose a patient-level mutation rate threshold. Default: **≥ 5%**.
+
+```{r freq-threshold}
+freq_threshold <- 5    # in percent; adjustable
+
+msk_freq_panel <- gene_freq %>%
+  filter(rate_pct >= freq_threshold) %>%
+  pull(Hugo_Symbol)
+
+cat("Threshold: mutation rate >=", freq_threshold, "%\n")
+cat("MSK BC genes passing threshold:", length(msk_freq_panel), "\n")
+print(msk_freq_panel)
+```
+
+---
+
+# Step 5 — Intersect COSMIC × MSK Frequency Panel
+
+```{r intersection}
+final_panel <- intersect(breast_drivers$GENE_SYMBOL, msk_freq_panel)
+
+cat("==== FINAL PANEL (COSMIC breast drivers ∩ MSK freq >=",
+    freq_threshold, "%) ====\n")
+cat("N =", length(final_panel), "genes\n\n")
+print(final_panel)
+```
+
+Cross-reference: which genes were in MSK panel but NOT in COSMIC breast list?
+
+```{r msk-only}
+msk_only <- setdiff(msk_freq_panel, breast_drivers$GENE_SYMBOL)
+cat("In MSK freq panel but NOT in COSMIC breast list:\n")
+print(msk_only)
+```
+
+Cross-reference: which COSMIC breast drivers were NOT frequent enough in MSK?
+
+```{r cosmic-only}
+cosmic_only <- setdiff(breast_drivers$GENE_SYMBOL, msk_freq_panel)
+cat("COSMIC breast drivers with mutation rate <", freq_threshold,
+    "% in MSK cohort (excluded):\n")
+print(cosmic_only)
+```
+
+---
+
+# Step 6 — Final Panel Summary Table
+
+```{r panel-summary}
+panel_summary <- gene_freq %>%
+  filter(Hugo_Symbol %in% final_panel) %>%
+  left_join(
+    breast_drivers %>% select(GENE_SYMBOL, TIER, ROLE_IN_CANCER),
+    by = c("Hugo_Symbol" = "GENE_SYMBOL")
+  ) %>%
+  arrange(desc(rate_pct))
+
+kable(panel_summary,
+      caption = "Final gene panel with mutation frequency and COSMIC role")
+```
+
+---
+
+# Step 7 — Save Outputs
+
+Save the final panel + summary for downstream analysis scripts.
+
+```{r save}
+# ---- Create a dataset subfolder under Final Project --------------------
+dataset_dir <- file.path(final_dir, "dataset")
+dir.create(dataset_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Final panel as a character vector saved to RDS (simple to reload)
+saveRDS(final_panel, file.path(dataset_dir, "final_panel.rds"))
+
+# Summary table as CSV
+write.csv(panel_summary,
+          file.path(dataset_dir, "final_panel_summary.csv"),
+          row.names = FALSE)
+
+# Also save breast drivers list + gene frequency table for reference
+write.csv(breast_drivers,
+          file.path(dataset_dir, "cosmic_breast_drivers.csv"),
+          row.names = FALSE)
+
+write.csv(gene_freq,
+          file.path(dataset_dir, "msk_bc_gene_frequency.csv"),
+          row.names = FALSE)
+
+cat("Saved to:", dataset_dir, "\n")
+cat(" - final_panel.rds\n")
+cat(" - final_panel_summary.csv\n")
+cat(" - cosmic_breast_drivers.csv\n")
+cat(" - msk_bc_gene_frequency.csv\n")
+```
+
+---
+
+# Notes / Next Steps
+
+- If the resulting panel is too small (< 8 genes), consider lowering the
+  frequency threshold to 2% (`freq_threshold <- 2`), or relaxing the COSMIC
+  breast filter (e.g., include any gene whose `TISSUE_TYPE` field mentions
+  breast-related tissues).
+- If the panel feels too large (> 20 genes), restrict COSMIC to **Tier 1**
+  only using `breast_drivers_tier1` from Step 2.
+- The resulting `final_panel` will be loaded by the downstream analysis
+  scripts (descriptive stats, KM, Cox, interaction, RMST, sensitivity
+  analyses).
