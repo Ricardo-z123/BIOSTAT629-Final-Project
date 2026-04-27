@@ -1,0 +1,804 @@
+---
+title: "Cancer Driver Gene Mutations and Subtype-Specific Effects on Overall Survival in Breast Cancer"
+subtitle: "Integrated Analysis Pipeline · MSK-CHORD 2024 · BIOSTAT 629 Final Project"
+author: |
+  Yiqiao Zhu  
+  [GitHub Repository](https://github.com/Ricardo-z123/BIOSTAT629-Final-Project) · [Website](https://ricardo-z123.github.io/BIOSTAT629-Final-Project-website/)
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+set.seed(42)   # fixed seed for reproducibility
+```
+
+# Setup
+
+## Libraries
+
+```{r}
+required_pkgs <- c("dplyr", "tidyr", "readr", "knitr", "purrr", "ggplot2",
+                   "survival", "survminer", "broom", "survRM2", "tibble")
+
+install.packages(required_pkgs, repos = "https://cloud.r-project.org")
+
+```
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(knitr)
+library(purrr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(broom)
+library(survRM2)
+library(tibble)
+```
+
+## Paths
+
+```{r paths}
+# ---- Portable project paths (relative to this Rmd) ------------------------
+# When knitting an Rmd, R's working directory is the Rmd's own folder by
+# default, so all relative paths anchor to the location of this file.
+dataset_dir <- "dataset"
+plot_dir    <- "plots"
+dir.create(dataset_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plot_dir,    showWarnings = FALSE, recursive = TRUE)
+
+# ---- COSMIC (local; auto-detect across common locations) ------------------
+cosmic_filename <- "Cosmic_CancerGeneCensus_v103_GRCh38.tsv"
+
+cosmic_candidates <- c(
+  cosmic_filename,                                                       # same dir as Rmd
+  file.path("Cosmic_CancerGeneCensus_Tsv_v103_GRCh38", cosmic_filename), # subfolder
+  file.path("cosmic", cosmic_filename),                                  # generic subfolder
+  file.path("data",   cosmic_filename)                                   # generic subfolder
+)
+
+cosmic_path <- cosmic_candidates[file.exists(cosmic_candidates)][1]
+
+if (is.na(cosmic_path)) {
+  stop("COSMIC file not found. Please place '", cosmic_filename,
+       "' in the same folder as this Rmd file.")
+}
+cat("Using COSMIC file:", cosmic_path, "\n")
+
+# ---- MSK-CHORD 2024 (remote, cBioPortal datahub) --------------------------
+msk_base <- paste0(
+  "https://media.githubusercontent.com/media/cBioPortal/datahub/",
+  "refs/heads/master/public/msk_chord_2024/"
+)
+
+patient_url <- paste0(msk_base, "data_clinical_patient.txt")
+sample_url  <- paste0(msk_base, "data_clinical_sample.txt")
+mut_url     <- paste0(msk_base, "data_mutations.txt")
+```
+
+## Load raw data
+
+```{r load-raw}
+# COSMIC Cancer Gene Census (local)
+cgc <- read.delim(cosmic_path, sep = "\t", header = TRUE,
+                  stringsAsFactors = FALSE, quote = "")
+
+# MSK-CHORD 2024 (remote)
+pat  <- read.delim(patient_url, comment.char = "#",
+                   stringsAsFactors = TRUE, check.names = FALSE)
+samp <- read.delim(sample_url,  comment.char = "#",
+                   stringsAsFactors = TRUE, check.names = FALSE)
+mut  <- read.delim(mut_url,     comment.char = "#",
+                   stringsAsFactors = TRUE, check.names = FALSE)
+
+cat("CGC genes      :", nrow(cgc),  "\n")
+cat("Patient rows   :", nrow(pat),  "\n")
+cat("Sample rows    :", nrow(samp), "\n")
+cat("Mutation rows  :", nrow(mut),  "\n")
+```
+
+------------------------------------------------------------------------
+
+# Part 1 — Gene Panel Selection
+
+Construct an evidence-based breast cancer driver gene panel by
+intersecting:
+
+1.  **COSMIC Cancer Gene Census v103** — externally curated cancer
+    driver genes whose `TUMOUR_TYPES_SOMATIC` field includes "breast",
+    restricted to Tier-1 evidence.
+2.  **MSK-CHORD 2024 breast cohort** — genes with patient-level mutation
+    rate $\geq 5\%$ (ensures power for subtype-stratified analyses).
+
+The panel is the **intersection** of the two lists.
+
+## Filter COSMIC for breast cancer drivers
+
+```{r cosmic-breast}
+breast_drivers <- cgc %>%
+  filter(grepl("breast", TUMOUR_TYPES_SOMATIC, ignore.case = TRUE)) %>%
+  select(GENE_SYMBOL, TIER, ROLE_IN_CANCER, TUMOUR_TYPES_SOMATIC)
+
+cat("Breast-related drivers in CGC:", nrow(breast_drivers), "\n")
+
+# Tier-1 only (strong evidence)
+breast_drivers_tier1 <- breast_drivers %>% filter(TIER == "1")
+cat("Breast Tier-1 drivers        :", nrow(breast_drivers_tier1), "\n")
+```
+
+## MSK-CHORD breast cohort: patient-level mutation frequencies
+
+```{r msk-freq}
+bc_samp <- samp %>% filter(CANCER_TYPE == "Breast Cancer")
+bc_ids  <- unique(bc_samp$PATIENT_ID)
+
+cat("BC samples :", nrow(bc_samp),     "\n")
+cat("BC patients:", length(bc_ids),    "\n")
+
+bc_mut <- mut %>%
+  filter(Tumor_Sample_Barcode %in% bc_samp$SAMPLE_ID) %>%
+  inner_join(bc_samp %>% select(SAMPLE_ID, PATIENT_ID),
+             by = c("Tumor_Sample_Barcode" = "SAMPLE_ID"))
+
+gene_freq <- bc_mut %>%
+  distinct(PATIENT_ID, Hugo_Symbol) %>%
+  count(Hugo_Symbol, name = "n_mut") %>%
+  mutate(rate_pct = round(n_mut / length(bc_ids) * 100, 2)) %>%
+  arrange(desc(n_mut))
+
+freq_threshold <- 5  # in percent
+msk_freq_panel <- gene_freq %>%
+  filter(rate_pct >= freq_threshold) %>%
+  pull(Hugo_Symbol)
+
+cat("Threshold: mutation rate >=", freq_threshold, "%\n")
+cat("MSK BC genes passing threshold:", length(msk_freq_panel), "\n")
+print(msk_freq_panel)
+```
+
+## Intersection → final 8-gene panel
+
+```{r intersection}
+final_panel <- intersect(breast_drivers_tier1$GENE_SYMBOL, msk_freq_panel)
+
+cat("==== FINAL PANEL (COSMIC Tier-1 breast drivers ∩ MSK freq >=",
+    freq_threshold, "%) ====\n")
+cat("N =", length(final_panel), "genes\n")
+print(final_panel)
+```
+
+```{r panel-summary}
+panel_summary <- gene_freq %>%
+  filter(Hugo_Symbol %in% final_panel) %>%
+  left_join(
+    breast_drivers %>% select(GENE_SYMBOL, TIER, ROLE_IN_CANCER),
+    by = c("Hugo_Symbol" = "GENE_SYMBOL")
+  ) %>%
+  arrange(desc(rate_pct))
+
+kable(panel_summary,
+      caption = "Final gene panel with mutation frequency and CGC role")
+
+# Persist for reproducibility
+saveRDS(final_panel, file.path(dataset_dir, "final_panel.rds"))
+write.csv(panel_summary,
+          file.path(dataset_dir, "final_panel_summary.csv"),
+          row.names = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Part 2 — Analytic Dataset Construction
+
+Build the analytic dataset (`df_analysis`) used for all downstream
+survival modeling, containing:
+
+-   **Outcome**: `OS_MONTHS`, `OS_EVENT`
+-   **Primary exposures**: 8 binary patient-level mutation indicators
+-   **Effect modifier**: `SUBTYPE` (LumA / LumB / HER2E / TNBC)
+-   **Confounders**: `AGE`, `STAGE` (I–IV)
+-   **Sensitivity-analysis variables**: `TMB`
+
+## Patient-level mutation indicators (panel genes)
+
+A patient is mutated (1) for a gene if **any** of their tumor samples
+harbors a mutation in that gene; wild-type (0) otherwise.
+
+```{r mutation-indicators}
+bc_mut_panel <- mut %>%
+  filter(Tumor_Sample_Barcode %in% bc_samp$SAMPLE_ID,
+         Hugo_Symbol %in% final_panel) %>%
+  inner_join(bc_samp %>% select(SAMPLE_ID, PATIENT_ID),
+             by = c("Tumor_Sample_Barcode" = "SAMPLE_ID"))
+
+mut_wide <- bc_mut_panel %>%
+  distinct(PATIENT_ID, Hugo_Symbol) %>%
+  mutate(x = 1L) %>%
+  pivot_wider(names_from = Hugo_Symbol, values_from = x, values_fill = 0L)
+
+# Ensure every panel gene has a column (even if 0 mutations)
+for (g in final_panel) {
+  if (!g %in% names(mut_wide)) mut_wide[[g]] <- 0L
+}
+mut_wide <- mut_wide[, c("PATIENT_ID", final_panel)]
+
+cat("Patients with >=1 mutation in panel genes:", nrow(mut_wide), "\n")
+```
+
+## Aggregate sample-level attributes to patient level
+
+Highest STAGE across samples (worst-case clinical interpretation); max
+TMB across samples
+
+```{r sample-aggregation}
+recode_stage <- function(x) {
+  dplyr::case_when(
+    x %in% c("1", "1A", "1B")  ~ 1L,
+    x %in% c("2A", "2B")       ~ 2L,
+    x %in% c("3A", "3B", "3C") ~ 3L,
+    x == "4"                   ~ 4L,
+    TRUE                       ~ NA_integer_
+  )
+}
+
+bc_samp2 <- bc_samp %>%
+  mutate(STAGE_INT = recode_stage(as.character(CLINICAL_GROUP)),
+         TMB_NUM   = suppressWarnings(as.numeric(as.character(TMB_NONSYNONYMOUS))))
+
+sample_agg <- bc_samp2 %>%
+  group_by(PATIENT_ID) %>%
+  summarise(
+    STAGE       = suppressWarnings(max(STAGE_INT, na.rm = TRUE)),
+    TMB         = suppressWarnings(max(TMB_NUM,   na.rm = TRUE)),
+    HAS_PRIMARY = as.integer(any(SAMPLE_TYPE == "Primary", na.rm = TRUE)),
+    N_SAMPLES   = n(),
+    .groups     = "drop"
+  ) %>%
+  mutate(
+    STAGE = ifelse(is.infinite(STAGE), NA_integer_, STAGE),
+    TMB   = ifelse(is.infinite(TMB),   NA_real_,    TMB)
+  )
+```
+
+## Clean patient-level clinical data + derive SUBTYPE
+
+```{r clinical-clean}
+pat_bc <- pat %>%
+  filter(PATIENT_ID %in% bc_ids) %>%
+  select(PATIENT_ID, OS_MONTHS, OS_STATUS,
+         CURRENT_AGE_DEID, RACE, HR, HER2) %>%
+  rename(AGE = CURRENT_AGE_DEID) %>%
+  mutate(
+    OS_MONTHS = suppressWarnings(as.numeric(as.character(OS_MONTHS))),
+    AGE       = suppressWarnings(as.numeric(as.character(AGE))),
+    OS_EVENT = dplyr::case_when(
+      OS_STATUS == "1:DECEASED" ~ 1L,
+      OS_STATUS == "0:LIVING"   ~ 0L,
+      TRUE                      ~ NA_integer_
+    ),
+    # SUBTYPE from HR x HER2
+    SUBTYPE = dplyr::case_when(
+      HR == "Yes" & HER2 == "No"  ~ "LumA",
+      HR == "Yes" & HER2 == "Yes" ~ "LumB",
+      HR == "No"  & HER2 == "Yes" ~ "HER2E",
+      HR == "No"  & HER2 == "No"  ~ "TNBC",
+      TRUE                         ~ NA_character_
+    )
+  )
+
+cat("HR distribution:\n");      print(table(pat_bc$HR,      useNA = "ifany"))
+cat("\nHER2 distribution:\n");  print(table(pat_bc$HER2,    useNA = "ifany"))
+cat("\nSUBTYPE distribution:\n"); print(table(pat_bc$SUBTYPE, useNA = "ifany"))
+```
+
+## Merge components, filter, and code factors
+
+```{r merge-filter-factor}
+df <- pat_bc %>%
+  left_join(mut_wide,   by = "PATIENT_ID") %>%
+  left_join(sample_agg, by = "PATIENT_ID") %>%
+  # patients without any mutation record -> wild-type for all panel genes
+  mutate(across(all_of(final_panel),
+                ~ ifelse(is.na(.), 0L, as.integer(.))))
+
+cat("Rows after merge:", nrow(df), "\n")
+
+cat("\nMissingness BEFORE filter:\n")
+sapply(df %>% select(OS_MONTHS, OS_EVENT, AGE, STAGE, SUBTYPE),
+       function(x) sum(is.na(x))) %>% print()
+
+df <- df %>%
+  filter(!is.na(OS_MONTHS), !is.na(OS_EVENT),
+         !is.na(AGE),       !is.na(STAGE),
+         !is.na(SUBTYPE))
+
+cat("\nRows after filter:", nrow(df), "\n")
+
+# Factor coding for downstream modeling
+df <- df %>%
+  mutate(
+    STAGE   = factor(STAGE, levels = 1:4, labels = c("I", "II", "III", "IV")),
+    SUBTYPE = factor(SUBTYPE, levels = c("LumA", "LumB", "HER2E", "TNBC")),
+    across(all_of(final_panel),
+           ~ factor(., levels = c(0, 1), labels = c("Wild-type", "Mutated")))
+  )
+
+# Persist analytic dataset
+saveRDS(df, file.path(dataset_dir, "df_analysis.rds"))
+write.csv(df %>% mutate(across(where(is.factor), as.character)),
+          file.path(dataset_dir, "df_analysis.csv"), row.names = FALSE)
+```
+
+## Cohort overview
+
+```{r cohort-overview}
+cat("==== Analytic cohort summary ====\n")
+cat("N patients        :", nrow(df), "\n")
+cat("Events (deaths)   :", sum(df$OS_EVENT == 1), "\n")
+cat("Censored          :", sum(df$OS_EVENT == 0), "\n")
+cat("Median follow-up  :", round(median(df$OS_MONTHS, na.rm = TRUE), 1), "months\n\n")
+
+cat("SUBTYPE distribution:\n")
+print(table(df$SUBTYPE, useNA = "ifany"))
+
+cat("\nMutation rate per gene (overall):\n")
+sapply(df[, final_panel],
+       function(x) round(mean(x == "Mutated"), 3)) %>%
+  sort(decreasing = TRUE) %>% print()
+```
+
+```{r mut-rate-by-subtype}
+rate_matrix <- sapply(final_panel, function(g) {
+  tapply(df[[g]] == "Mutated", df$SUBTYPE, mean)
+})
+rate_matrix <- round(rate_matrix * 100, 1)
+kable(as.data.frame(rate_matrix),
+      caption = "Mutation rate (%) per gene by subtype")
+```
+
+------------------------------------------------------------------------
+
+# Part 3 — Survival Analysis
+
+## Cohort Overview (Table 1 by subtype)
+
+```{r table1-by-subtype}
+gene_terms <- paste(final_panel, collapse = " + ")
+
+t1 <- df %>%
+  group_by(SUBTYPE) %>%
+  summarise(
+    N          = n(),
+    Deaths     = sum(OS_EVENT == 1),
+    Died_pct   = sprintf("%.1f%%", 100 * mean(OS_EVENT == 1)),
+    Age_median = round(median(AGE), 1),
+    Age_IQR    = paste0(round(quantile(AGE, .25), 0), "-",
+                        round(quantile(AGE, .75), 0)),
+    Stage_I    = sprintf("%.1f%%", 100 * mean(STAGE == "I")),
+    Stage_II   = sprintf("%.1f%%", 100 * mean(STAGE == "II")),
+    Stage_III  = sprintf("%.1f%%", 100 * mean(STAGE == "III")),
+    Stage_IV   = sprintf("%.1f%%", 100 * mean(STAGE == "IV")),
+    .groups    = "drop"
+  )
+kable(t1, caption = "Table 1 — Baseline characteristics by subtype")
+```
+
+## Kaplan–Meier curves (4-panel by subtype, per gene)
+
+```{r km-loop, fig.width=12, fig.height=10}
+make_km_for_gene <- function(gene) {
+  plots <- list()
+  for (st in levels(df$SUBTYPE)) {
+    sub  <- df %>% filter(SUBTYPE == st)
+    form <- as.formula(paste0("Surv(OS_MONTHS, OS_EVENT) ~ ", gene))
+    fit  <- surv_fit(form, data = sub)
+
+    p <- ggsurvplot(
+      fit, data = sub,
+      palette       = c("#2E9FDF", "#E7B800"),
+      legend.labs   = c("Wild-type", "Mutated"),
+      legend.title  = gene,
+      title         = st,
+      xlab          = "Time (Months)",
+      ylab          = "Survival",
+      conf.int      = TRUE,
+      pval          = TRUE,
+      risk.table    = FALSE,
+      xlim          = c(0, 120),
+      ggtheme       = theme_classic(base_size = 11)
+    )
+    plots[[st]] <- p
+  }
+  plots
+}
+
+for (g in final_panel) {
+  pl <- make_km_for_gene(g)
+  combined <- arrange_ggsurvplots(list(pl$LumA, pl$LumB, pl$HER2E, pl$TNBC),
+                                  ncol = 2, nrow = 2,
+                                  title = paste0("KM by Subtype — ", g),
+                                  print = FALSE)
+  png(file.path(plot_dir, paste0("KM_", g, "_bySubtype.png")),
+      width = 12, height = 10, units = "in", res = 200)
+  print(combined)
+  dev.off()
+}
+
+cat("KM plots saved to:", plot_dir, "\n")
+```
+
+```{r km-display-tp53, fig.width=12, fig.height=10, echo=FALSE}
+pl <- make_km_for_gene("TP53")
+arrange_ggsurvplots(list(pl$LumA, pl$LumB, pl$HER2E, pl$TNBC),
+                    ncol = 2, nrow = 2,
+                    title = "KM by Subtype — TP53",
+                    print = TRUE)
+```
+
+## Univariate (crude) Cox models — gene × subtype
+
+```{r univariate-cox}
+uni_results <- expand.grid(
+  Gene    = final_panel,
+  Subtype = levels(df$SUBTYPE),
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+) %>%
+  rowwise() %>%
+  mutate(
+    res = list({
+      sub  <- df %>% filter(SUBTYPE == Subtype)
+      form <- as.formula(paste0("Surv(OS_MONTHS, OS_EVENT) ~ ", Gene))
+      fit  <- coxph(form, data = sub)
+      tidy(fit, exponentiate = TRUE, conf.int = TRUE)
+    })
+  ) %>%
+  ungroup() %>%
+  unnest(res) %>%
+  filter(grepl("Mutated", term)) %>%
+  transmute(
+    Gene, Subtype,
+    HR       = round(estimate, 3),
+    CI_low   = round(conf.low,  3),
+    CI_high  = round(conf.high, 3),
+    p.value  = signif(p.value,  4)
+  )
+
+kable(uni_results, caption = "Univariate Cox — crude HR per gene × subtype")
+```
+
+```{r heatmap-crude, fig.width=8, fig.height=6}
+hm_crude <- uni_results %>%
+  mutate(
+    logHR = log(HR),
+    sig   = ifelse(p.value < 0.05, "*", ""),
+    HR_label = ifelse(HR == 0 | is.infinite(CI_high),
+                      "N/E", sprintf("%.2f%s", HR, sig)),
+    logHR = ifelse(HR_label == "N/E", NA, logHR),
+    Gene    = factor(Gene, levels = rev(final_panel)),
+    Subtype = factor(Subtype, levels = levels(df$SUBTYPE))
+  )
+
+p_crude <- ggplot(hm_crude, aes(x = Subtype, y = Gene, fill = logHR)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = HR_label), size = 3.5) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, na.value = "gray70", name = "log(HR)") +
+  labs(title = "Crude HR (Unadjusted)",
+       subtitle = "Univariate Cox per gene × subtype (* = p < 0.05, N/E = not estimable)",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p_crude)
+ggsave(file.path(plot_dir, "HR_heatmap_crude.png"),
+       p_crude, width = 8, height = 6, dpi = 300)
+```
+
+## Subtype-stratified multivariable Cox (main analysis)
+
+```{r stratified-cox}
+fit_strat <- function(st) {
+  sub  <- df %>% filter(SUBTYPE == st)
+  form <- as.formula(paste0("Surv(OS_MONTHS, OS_EVENT) ~ ",
+                            gene_terms, " + AGE + STAGE"))
+  fit  <- coxph(form, data = sub)
+  list(fit = fit, n = nrow(sub), events = sum(sub$OS_EVENT == 1),
+       tidy_tbl = tidy(fit, exponentiate = TRUE, conf.int = TRUE))
+}
+
+strat_list <- lapply(levels(df$SUBTYPE), fit_strat)
+names(strat_list) <- levels(df$SUBTYPE)
+
+sizes <- data.frame(
+  Subtype = names(strat_list),
+  N       = sapply(strat_list, function(x) x$n),
+  Events  = sapply(strat_list, function(x) x$events)
+)
+kable(sizes, caption = "Subtype cohort sizes and event counts")
+
+strat_results <- map2_dfr(strat_list, names(strat_list), function(x, st) {
+  x$tidy_tbl %>%
+    filter(grepl("Mutated", term)) %>%
+    mutate(
+      Subtype = st,
+      Gene    = gsub("Mutated$", "", term),
+      HR      = round(estimate, 3),
+      CI_low  = round(conf.low,  3),
+      CI_high = round(conf.high, 3),
+      p.value = signif(p.value,  4)
+    ) %>%
+    select(Gene, Subtype, HR, CI_low, CI_high, p.value)
+})
+
+kable(strat_results,
+      caption = "Subtype-stratified multivariable Cox — adjusted HR per gene × subtype")
+```
+
+```{r heatmap-adjusted, fig.width=8, fig.height=6}
+hm_adj <- strat_results %>%
+  mutate(
+    logHR = log(HR),
+    sig   = ifelse(p.value < 0.05, "*", ""),
+    HR_label = ifelse(HR == 0 | is.infinite(CI_high),
+                      "N/E", sprintf("%.2f%s", HR, sig)),
+    logHR = ifelse(HR_label == "N/E", NA, logHR),
+    Gene    = factor(Gene, levels = rev(final_panel)),
+    Subtype = factor(Subtype, levels = levels(df$SUBTYPE))
+  )
+
+p_adj <- ggplot(hm_adj, aes(x = Subtype, y = Gene, fill = logHR)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = HR_label), size = 3.5) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, na.value = "gray70", name = "log(HR)") +
+  labs(title = "Adjusted HR — Gene × Subtype",
+       subtitle = "Multivariable Cox (adjusted for age + stage); * = p < 0.05, N/E = not estimable",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+print(p_adj)
+ggsave(file.path(plot_dir, "HR_heatmap_adjusted.png"),
+       p_adj, width = 8, height = 6, dpi = 300)
+```
+
+```{r forest-by-subtype, fig.width=11, fig.height=9}
+forest_df <- strat_results %>%
+  filter(HR > 0, !is.infinite(CI_high), !is.na(HR)) %>%
+  mutate(Gene = factor(Gene, levels = rev(final_panel)),
+         sig  = ifelse(p.value < 0.05, "Significant", "Not significant"))
+
+p_forest <- ggplot(forest_df, aes(x = HR, y = Gene, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high),
+                 height = 0.25, linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Significant"     = "#C0392B",
+                                "Not significant" = "#7F8C8D"),
+                     name = NULL) +
+  facet_wrap(~ Subtype, scales = "free_x", ncol = 2) +
+  scale_x_log10() +
+  labs(title    = "Forest Plot — Adjusted HR by Subtype",
+       subtitle = "Multivariable Cox per subtype, adjusted for age + stage (N/E combinations excluded)",
+       x = "Hazard Ratio (log scale)", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.background = element_rect(fill = "#003366", color = NA),
+        strip.text       = element_text(color = "white", face = "bold"))
+
+print(p_forest)
+ggsave(file.path(plot_dir, "Forest_bySubtype.png"),
+       p_forest, width = 11, height = 9, dpi = 300)
+```
+
+## Multiple testing correction (BH)
+
+```{r bh-correction}
+strat_results <- strat_results %>%
+  mutate(q_BH    = signif(p.adjust(p.value, method = "BH"), 4),
+         sig_raw = ifelse(p.value < 0.05, "*", ""),
+         sig_BH  = ifelse(q_BH    < 0.05, "*", ""))
+
+kable(strat_results %>% arrange(q_BH),
+      caption = "Subtype-stratified HR with BH-adjusted q-values (32 tests)")
+
+n_raw <- sum(strat_results$p.value < 0.05)
+n_bh  <- sum(strat_results$q_BH    < 0.05)
+cat("Significant (raw p < 0.05) :", n_raw, "/", nrow(strat_results), "\n")
+cat("Significant (BH q < 0.05)  :", n_bh,  "/", nrow(strat_results), "\n\n")
+
+kable(strat_results %>% filter(q_BH < 0.05) %>% arrange(q_BH),
+      caption = "Gene × Subtype combinations surviving BH (q < 0.05)")
+```
+
+## Proportional hazards check (Schoenfeld) for BH-significant hits
+
+```{r ph-check}
+hits <- data.frame(
+  Gene    = c("ESR1", "TP53", "CDH1", "TP53"),
+  Subtype = c("LumA", "LumA", "LumB", "TNBC")
+)
+
+ph_hits <- purrr::pmap_dfr(hits, function(Gene, Subtype) {
+  fit <- strat_list[[Subtype]]$fit
+  zph <- cox.zph(fit)
+  row <- as.data.frame(zph$table) %>%
+    tibble::rownames_to_column("variable") %>%
+    filter(variable == Gene)
+  data.frame(
+    Gene      = Gene,
+    Subtype   = Subtype,
+    chisq     = round(row$chisq, 3),
+    p_value   = signif(row$p, 4),
+    PH_status = ifelse(row$p < 0.05, "Violated", "Not violated")
+  )
+})
+
+kable(ph_hits,
+      caption = "PH assumption check for the 4 BH-significant gene × subtype hits")
+```
+
+## RMST validation (τ = 60 months)
+
+```{r rmst}
+tau_months <- 60
+
+rmst_bh <- purrr::pmap_dfr(hits, function(Gene, Subtype) {
+  sub <- df %>% filter(SUBTYPE == Subtype)
+  arm <- ifelse(sub[[Gene]] == "Mutated", 1L, 0L)
+  r <- rmst2(time = sub$OS_MONTHS, status = sub$OS_EVENT,
+             arm = arm, tau = tau_months)
+  d <- r$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+  data.frame(
+    Gene, Subtype,
+    RMST_diff = round(d["Est."],     2),
+    CI_low    = round(d["lower .95"], 2),
+    CI_high   = round(d["upper .95"], 2),
+    p_value   = signif(d["p"],       4)
+  )
+})
+
+kable(rmst_bh,
+      caption = paste0("RMST validation of BH-significant hits (τ = ",
+                       tau_months, " months)"))
+```
+
+```{r rmst-forest, fig.width=8, fig.height=4}
+plot_df_rmst <- rmst_bh %>%
+  mutate(label = paste(Gene, Subtype, sep = " × "))
+
+p_rmst <- ggplot(plot_df_rmst,
+                 aes(x = RMST_diff, y = label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high),
+                 height = 0.2, linewidth = 0.7, color = "#003366") +
+  geom_point(size = 3.5, color = "#003366") +
+  geom_text(aes(label = sprintf("%.2f", RMST_diff)),
+            vjust = -0.8, size = 3.5) +
+  labs(title = "RMST Difference (Mutated − Wild-type, τ = 60 months)",
+       subtitle = "Negative = fewer life-months for mutation carriers",
+       x = "RMST Difference (months)", y = NULL) +
+  theme_classic(base_size = 12)
+
+print(p_rmst)
+ggsave(file.path(plot_dir, "RMST_forest.png"),
+       p_rmst, width = 8, height = 4, dpi = 300)
+```
+
+## Sensitivity analysis — TMB adjustment
+
+```{r tmb-sensitivity}
+df_tmb <- df %>%
+  filter(!is.na(TMB)) %>%
+  mutate(log_TMB = log(TMB + 1))
+
+cat("TMB-adjustable cohort size:", nrow(df_tmb),
+    "(", round(nrow(df_tmb) / nrow(df) * 100, 1), "% of full)\n\n")
+
+strat_tmb <- lapply(levels(df_tmb$SUBTYPE), function(st) {
+  sub  <- df_tmb %>% filter(SUBTYPE == st)
+  form <- as.formula(paste0("Surv(OS_MONTHS, OS_EVENT) ~ ",
+                            gene_terms, " + AGE + STAGE + log_TMB"))
+  fit  <- suppressWarnings(coxph(form, data = sub))
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(grepl("Mutated", term)) %>%
+    mutate(Subtype = st,
+           Gene    = gsub("Mutated$", "", term),
+           HR      = round(estimate, 3),
+           CI_low  = round(conf.low, 3),
+           CI_high = round(conf.high, 3),
+           p.value = signif(p.value, 4)) %>%
+    select(Gene, Subtype, HR, CI_low, CI_high, p.value)
+}) %>% bind_rows()
+
+compare_tmb <- strat_results %>%
+  select(Gene, Subtype, HR_main = HR,
+         CIlo_main = CI_low, CIhi_main = CI_high, p_main = p.value) %>%
+  left_join(strat_tmb %>%
+              select(Gene, Subtype, HR_tmb = HR,
+                     CIlo_tmb = CI_low, CIhi_tmb = CI_high, p_tmb = p.value),
+            by = c("Gene", "Subtype"))
+
+kable(compare_tmb %>% semi_join(hits, by = c("Gene", "Subtype")),
+      caption = "Main vs TMB-adjusted Cox (BH-significant hits only)")
+```
+
+```{r tmb-dumbbell, fig.width=8, fig.height=6}
+bh_hits <- c("ESR1_LumA", "TP53_LumA", "CDH1_LumB", "TP53_TNBC")
+
+plot_df_tmb <- compare_tmb %>%
+  mutate(id = paste(Gene, Subtype, sep = "_")) %>%
+  filter(id %in% bh_hits) %>%
+  pivot_longer(
+    cols = c(HR_main, HR_tmb, CIlo_main, CIlo_tmb, CIhi_main, CIhi_tmb),
+    names_to = c(".value", "Analysis"),
+    names_pattern = "(HR|CIlo|CIhi)_(main|tmb)"
+  ) %>%
+  mutate(Analysis = factor(Analysis,
+                           levels = c("main", "tmb"),
+                           labels = c("Main", "TMB-adjusted")),
+         label = paste(Gene, Subtype, sep = " × "))
+
+p_tmb <- ggplot(plot_df_tmb, aes(x = HR, y = label, color = Analysis)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = CIlo, xmax = CIhi),
+                 height = 0.2, linewidth = 0.7,
+                 position = position_dodge(width = 0.4)) +
+  geom_point(size = 3.5, position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = c("Main" = "#003366", "TMB-adjusted" = "#16A085")) +
+  scale_x_log10(
+    breaks = c(1, 1.5, 2, 2.5, 3, 3.5, 4, 5),
+    labels = c("1", "1.5", "2", "2.5", "3", "3.5", "4", "5")
+  ) +
+  labs(title = "Sensitivity — BH-significant results: Main vs TMB-adjusted",
+       subtitle = "Error bars = 95% CI",
+       x = "Hazard Ratio (log scale)", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(p_tmb)
+ggsave(file.path(plot_dir, "Sens_tmb_dumbbell_CI.png"),
+       p_tmb, width = 8, height = 6, dpi = 300)
+```
+
+## Integrated summary — 4 BH-significant hits
+
+```{r final-summary}
+final_summary <- strat_results %>%
+  semi_join(hits, by = c("Gene", "Subtype")) %>%
+  select(Gene, Subtype,
+         HR, CI_low, CI_high, p_raw = p.value, q_BH) %>%
+  left_join(ph_hits %>% select(Gene, Subtype, PH_status),
+            by = c("Gene", "Subtype")) %>%
+  left_join(rmst_bh %>% select(Gene, Subtype,
+                                RMST_months = RMST_diff,
+                                RMST_p = p_value),
+            by = c("Gene", "Subtype")) %>%
+  left_join(compare_tmb %>% select(Gene, Subtype, HR_tmb),
+            by = c("Gene", "Subtype")) %>%
+  arrange(q_BH)
+
+kable(final_summary,
+      caption = "Integrated summary of 4 BH-significant gene × subtype hits with all validations")
+```
+
+------------------------------------------------------------------------
+
+# Session info
+
+```{r sessioninfo}
+sessionInfo()
+```
